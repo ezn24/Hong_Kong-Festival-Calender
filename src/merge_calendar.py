@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import os
 import re
 import tempfile
 import time
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -105,7 +107,7 @@ def validate_calendar(text: str, source_name: str) -> list[str]:
 
 def parse_tzid(logical_line: str) -> str | None:
     head = logical_line.split(":", 1)[0]
-    match = re.search(r"(?:^|;)TZID=(?:\"([^\"]+)\"|([^;:]+))", head, re.IGNORECASE)
+    match = re.search(r'(?:^|;)TZID=(?:"([^"]+)"|([^;:]+))', head, re.IGNORECASE)
     if not match:
         return None
     return match.group(1) or match.group(2)
@@ -276,12 +278,57 @@ def merge_calendars(official_text: str, icloud_text: str) -> tuple[str, MergeSta
     return output, stats
 
 
+def decode_payload(
+    payload: bytes,
+    content_encoding: str | None = None,
+    charset: str | None = None,
+) -> str:
+    encodings = [
+        item.strip().lower()
+        for item in (content_encoding or "").split(",")
+        if item.strip() and item.strip().lower() != "identity"
+    ]
+
+    for encoding in reversed(encodings):
+        if encoding in {"gzip", "x-gzip"}:
+            payload = gzip.decompress(payload)
+        elif encoding == "deflate":
+            try:
+                payload = zlib.decompress(payload)
+            except zlib.error:
+                payload = zlib.decompress(payload, -zlib.MAX_WBITS)
+        else:
+            raise ValueError(f"Unsupported Content-Encoding: {encoding}")
+
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
+
+    candidates: list[str] = []
+    if charset:
+        candidates.append(charset)
+    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        candidates.append("utf-16")
+    candidates.extend(["utf-8-sig", "utf-8"])
+
+    last_error: UnicodeDecodeError | LookupError | None = None
+    for candidate in dict.fromkeys(candidates):
+        try:
+            return payload.decode(candidate)
+        except (UnicodeDecodeError, LookupError) as error:
+            last_error = error
+
+    raise UnicodeDecodeError(
+        "utf-8", payload, 0, min(len(payload), 1), "unable to decode calendar payload"
+    ) from last_error
+
+
 def download_text(url: str, attempts: int = 3, timeout: int = 30) -> str:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Hong-Kong-Holiday-Calendar/1.0",
+            "User-Agent": "Hong-Kong-Holiday-Calendar/1.1",
             "Accept": "text/calendar,text/plain;q=0.9,*/*;q=0.1",
+            "Accept-Encoding": "identity",
         },
     )
     last_error: Exception | None = None
@@ -290,8 +337,11 @@ def download_text(url: str, attempts: int = 3, timeout: int = 30) -> str:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
-                content_type = response.headers.get_content_charset() or "utf-8-sig"
-                return payload.decode(content_type)
+                return decode_payload(
+                    payload,
+                    content_encoding=response.headers.get("Content-Encoding"),
+                    charset=response.headers.get_content_charset(),
+                )
         except Exception as error:
             last_error = error
             if attempt < attempts:
