@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import gzip
 import os
 import re
@@ -197,6 +198,145 @@ def add_holiday_suffix(event_lines: list[str]) -> list[str]:
     raise ValueError("VEVENT has no END:VEVENT")
 
 
+def parse_rrule(event_lines: list[str]) -> dict[str, str] | None:
+    for _, _, logical in unfold_groups(event_lines):
+        if property_name(logical) != "RRULE":
+            continue
+        value = property_value(logical)
+        if not value:
+            return None
+        rule: dict[str, str] = {}
+        for part in value.split(";"):
+            if "=" not in part:
+                continue
+            key, item = part.split("=", 1)
+            rule[key.upper()] = item.upper()
+        return rule
+    return None
+
+
+def parse_until_date(value: str) -> date:
+    if re.fullmatch(r"\d{8}", value):
+        return datetime.strptime(value, "%Y%m%d").date()
+    if re.fullmatch(r"\d{8}T\d{6}Z", value):
+        instant = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        return instant.astimezone(HONG_KONG_TZ).date()
+    if re.fullmatch(r"\d{8}T\d{6}", value):
+        return datetime.strptime(value, "%Y%m%dT%H%M%S").date()
+    raise ValueError(f"Unsupported RRULE UNTIL value: {value}")
+
+
+def parse_int_list(value: str | None) -> list[int]:
+    if not value:
+        return []
+    return [int(item) for item in value.split(",") if item]
+
+
+def weekday_number(code: str) -> int:
+    weekdays = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+    if code not in weekdays:
+        raise ValueError(f"Unsupported BYDAY weekday: {code}")
+    return weekdays[code]
+
+
+def dates_for_year(start: date, rule: dict[str, str], year: int) -> list[date]:
+    months = parse_int_list(rule.get("BYMONTH")) or [start.month]
+    month_days = parse_int_list(rule.get("BYMONTHDAY"))
+    bydays = [item for item in rule.get("BYDAY", "").split(",") if item]
+    results: set[date] = set()
+
+    for month in months:
+        last_day = calendar.monthrange(year, month)[1]
+        if month_days:
+            for raw_day in month_days:
+                day = raw_day if raw_day > 0 else last_day + raw_day + 1
+                if 1 <= day <= last_day:
+                    results.add(date(year, month, day))
+            continue
+
+        if bydays:
+            for token in bydays:
+                match = re.fullmatch(r"([+-]?\d+)?([A-Z]{2})", token)
+                if not match:
+                    raise ValueError(f"Unsupported BYDAY value: {token}")
+                ordinal_text, weekday_code = match.groups()
+                weekday = weekday_number(weekday_code)
+                matching_days = [
+                    day
+                    for day in range(1, last_day + 1)
+                    if date(year, month, day).weekday() == weekday
+                ]
+                if ordinal_text:
+                    ordinal = int(ordinal_text)
+                    index = ordinal - 1 if ordinal > 0 else ordinal
+                    if -len(matching_days) <= index < len(matching_days):
+                        results.add(date(year, month, matching_days[index]))
+                else:
+                    results.update(date(year, month, day) for day in matching_days)
+            continue
+
+        if start.day <= last_day:
+            results.add(date(year, month, start.day))
+
+    return sorted(results)
+
+
+def recurrence_dates_through(event_lines: list[str], end_year: int) -> set[date]:
+    start = parse_event_date(event_lines)
+    rule = parse_rrule(event_lines)
+    if start is None or rule is None:
+        return set()
+    if rule.get("FREQ") != "YEARLY":
+        return set()
+
+    interval = int(rule.get("INTERVAL", "1"))
+    count = int(rule["COUNT"]) if "COUNT" in rule else None
+    until = parse_until_date(rule["UNTIL"]) if "UNTIL" in rule else None
+    occurrences: list[date] = []
+
+    for year in range(start.year, end_year + 1):
+        if (year - start.year) % interval != 0:
+            continue
+        for occurrence in dates_for_year(start, rule, year):
+            if occurrence < start:
+                continue
+            if until is not None and occurrence > until:
+                continue
+            occurrences.append(occurrence)
+
+    occurrences.sort()
+    if count is not None:
+        occurrences = occurrences[:count]
+    return set(occurrences)
+
+
+def existing_exdates(event_lines: list[str]) -> set[date]:
+    result: set[date] = set()
+    for _, _, logical in unfold_groups(event_lines):
+        if property_name(logical) != "EXDATE":
+            continue
+        value = property_value(logical)
+        if not value:
+            continue
+        for item in value.split(","):
+            item = item.strip()
+            if re.fullmatch(r"\d{8}", item):
+                result.add(datetime.strptime(item, "%Y%m%d").date())
+    return result
+
+
+def add_exdates(event_lines: list[str], dates: set[date]) -> list[str]:
+    missing = sorted(dates - existing_exdates(event_lines))
+    if not missing:
+        return list(event_lines)
+    value = ",".join(item.strftime("%Y%m%d") for item in missing)
+    exdate_lines = fold_content_line(f"EXDATE;VALUE=DATE:{value}")
+    for index, line in enumerate(event_lines):
+        if line.strip().upper() == "END:VEVENT":
+            return event_lines[:index] + exdate_lines + event_lines[index:]
+    raise ValueError("VEVENT has no END:VEVENT")
+
+
 def unique_components(*component_groups: list[list[str]]) -> list[list[str]]:
     result: list[list[str]] = []
     seen: set[str] = set()
@@ -229,8 +369,16 @@ def merge_calendars(official_text: str, icloud_text: str) -> tuple[str, MergeSta
 
     icloud_records: list[EventRecord] = []
     removed = 0
+    latest_public_year = max((item.year for item in public_dates), default=date.today().year)
     for index, block in enumerate(icloud_blocks):
         event_date = parse_event_date(block)
+        recurrence_dates = recurrence_dates_through(block, latest_public_year)
+        if recurrence_dates:
+            overlaps = recurrence_dates & public_dates
+            updated_block = add_exdates(block, overlaps)
+            removed += len(overlaps)
+            icloud_records.append(EventRecord(updated_block, event_date, 1, index))
+            continue
         if event_date is not None and event_date in public_dates:
             removed += 1
             continue
@@ -326,7 +474,7 @@ def download_text(url: str, attempts: int = 3, timeout: int = 30) -> str:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Hong-Kong-Holiday-Calendar/1.1",
+            "User-Agent": "Hong-Kong-Holiday-Calendar/1.2",
             "Accept": "text/calendar,text/plain;q=0.9,*/*;q=0.1",
             "Accept-Encoding": "identity",
         },
@@ -384,7 +532,7 @@ def main() -> None:
         f"{args.output}: {stats.output_events} events "
         f"({stats.official_events} official, "
         f"{stats.icloud_events - stats.removed_icloud_events} iCloud retained, "
-        f"{stats.removed_icloud_events} iCloud removed)"
+        f"{stats.removed_icloud_events} iCloud occurrences suppressed)"
     )
 
 
