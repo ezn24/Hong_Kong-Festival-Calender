@@ -1,4 +1,4 @@
-# Hong Kong Holiday Calendar
+# Hong Kong Festival Calendar
 
 合併香港政府 1823 公眾假期日曆及 Apple iCloud 香港節日日曆，產生一個同時包含一般節日與公眾假期的 ICS 日曆。
 
@@ -20,7 +20,7 @@
 Repository 建立並首次執行 workflow 後，可使用以下網址訂閱：
 
 ```text
-https://raw.githubusercontent.com/ezn24/Hong-Kong-Holiday-Calendar/main/hong-kong-calendar.ics
+https://raw.githubusercontent.com/ezn24/Hong_Kong-Festival-Calender/main/hong-kong-calendar.ics
 ```
 
 ## 自動更新
