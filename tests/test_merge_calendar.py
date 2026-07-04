@@ -135,6 +135,86 @@ class MergeCalendarTests(unittest.TestCase):
             original,
         )
 
+    def test_yearly_recurring_event_gets_exdates_for_official_overlaps(self) -> None:
+        official = calendar(
+            event("official-2025", "20250701", "香港特別行政區成立紀念日"),
+            event("official-2026", "20260701", "香港特別行政區成立紀念日"),
+        )
+        recurring = "\r\n".join(
+            [
+                "BEGIN:VEVENT",
+                "UID:icloud-recurring",
+                "DTSTART;VALUE=DATE:20240701",
+                "SUMMARY:香港特別行政區成立紀念日",
+                "RRULE:FREQ=YEARLY;COUNT=5",
+                "END:VEVENT",
+            ]
+        )
+        merged, stats = merge_calendars(official, calendar(recurring))
+
+        self.assertIn("UID:icloud-recurring", merged)
+        self.assertIn("EXDATE;VALUE=DATE:20250701,20260701", merged)
+        self.assertEqual(stats.removed_icloud_events, 2)
+
+    def test_recurring_event_start_date_overlap_is_excluded_not_deleted(self) -> None:
+        official = calendar(event("official-2024", "20240101", "一月一日"))
+        recurring = "\r\n".join(
+            [
+                "BEGIN:VEVENT",
+                "UID:icloud-new-year",
+                "DTSTART;VALUE=DATE:20240101",
+                "SUMMARY:元旦",
+                "RRULE:FREQ=YEARLY;COUNT=5",
+                "END:VEVENT",
+            ]
+        )
+        merged, _ = merge_calendars(official, calendar(recurring))
+
+        self.assertIn("UID:icloud-new-year", merged)
+        self.assertIn("EXDATE;VALUE=DATE:20240101", merged)
+
+    def test_byday_recurrence_only_excludes_actual_occurrence(self) -> None:
+        official = calendar(
+            event("official-match", "20250511", "測試假日"),
+            event("official-nonmatch", "20260511", "另一假日"),
+        )
+        recurring = "\r\n".join(
+            [
+                "BEGIN:VEVENT",
+                "UID:icloud-mothers-day",
+                "DTSTART;VALUE=DATE:20240512",
+                "SUMMARY:母親節",
+                "RRULE:FREQ=YEARLY;COUNT=5;BYDAY=2SU;BYMONTH=5",
+                "END:VEVENT",
+            ]
+        )
+        merged, _ = merge_calendars(official, calendar(recurring))
+
+        self.assertIn("EXDATE;VALUE=DATE:20250511", merged)
+        exdate_line = merged.split("EXDATE;VALUE=DATE:", 1)[1].split("\r\n", 1)[0]
+        self.assertNotIn("20260511", exdate_line)
+
+    def test_existing_exdate_is_not_duplicated(self) -> None:
+        official = calendar(
+            event("official-2025", "20250701", "香港特別行政區成立紀念日"),
+            event("official-2026", "20260701", "香港特別行政區成立紀念日"),
+        )
+        recurring = "\r\n".join(
+            [
+                "BEGIN:VEVENT",
+                "UID:icloud-recurring",
+                "DTSTART;VALUE=DATE:20240701",
+                "SUMMARY:香港特別行政區成立紀念日",
+                "RRULE:FREQ=YEARLY;COUNT=5",
+                "EXDATE;VALUE=DATE:20250701",
+                "END:VEVENT",
+            ]
+        )
+        merged, _ = merge_calendars(official, calendar(recurring))
+
+        self.assertEqual(merged.count("EXDATE;VALUE=DATE:20250701"), 1)
+        self.assertIn("EXDATE;VALUE=DATE:20260701", merged)
+
 
 if __name__ == "__main__":
     unittest.main()
