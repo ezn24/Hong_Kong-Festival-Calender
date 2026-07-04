@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import gzip
 import sys
 import unittest
+import zlib
 from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from merge_calendar import add_holiday_suffix, merge_calendars, parse_event_date
+from merge_calendar import (
+    add_holiday_suffix,
+    decode_payload,
+    merge_calendars,
+    parse_event_date,
+)
 
 
 def calendar(*events: str) -> str:
@@ -106,6 +113,27 @@ class MergeCalendarTests(unittest.TestCase):
         icloud = calendar(event("icloud-1", "20260101", "第一日"))
         merged, _ = merge_calendars(official, icloud)
         self.assertLess(merged.index("UID:icloud-1"), merged.index("UID:official-2"))
+
+    def test_gzip_payload_is_detected_without_content_encoding_header(self) -> None:
+        original = calendar(event("icloud-1", "20260214", "情人節"))
+        compressed = gzip.compress(original.encode("utf-8"))
+        self.assertEqual(decode_payload(compressed, charset="utf-8"), original)
+
+    def test_gzip_content_encoding_is_supported(self) -> None:
+        original = calendar(event("icloud-1", "20260214", "情人節"))
+        compressed = gzip.compress(original.encode("utf-8"))
+        self.assertEqual(
+            decode_payload(compressed, content_encoding="gzip", charset="utf-8"),
+            original,
+        )
+
+    def test_deflate_content_encoding_is_supported(self) -> None:
+        original = calendar(event("icloud-1", "20260214", "情人節"))
+        compressed = zlib.compress(original.encode("utf-8"))
+        self.assertEqual(
+            decode_payload(compressed, content_encoding="deflate", charset="utf-8"),
+            original,
+        )
 
 
 if __name__ == "__main__":
